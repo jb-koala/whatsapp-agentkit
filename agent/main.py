@@ -109,7 +109,24 @@ async def webhook_handler(request: Request):
             if msg.es_propio or not msg.texto:
                 continue
 
-            logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
+            logger.info(f"Mensaje de {msg.telefono} ({msg.nombre}): {msg.texto}")
+
+            # Crear/actualizar lead en CRM inmediatamente con teléfono y alias
+            if _koala_cfg:
+                await upsert_lead_from_message(
+                    cfg=_koala_cfg,
+                    phone=msg.telefono,
+                    name=msg.nombre or None,
+                    last_message=msg.texto,
+                    conversation_id=msg.mensaje_id,
+                )
+
+            # Si es multimedia, responder que solo acepta texto (sin llamar a Claude)
+            if msg.texto == "__MULTIMEDIA__":
+                from agent.providers.twilio import ProveedorTwilio
+                await proveedor.enviar_mensaje(msg.telefono, ProveedorTwilio.MENSAJE_SOLO_TEXTO)
+                logger.info(f"Multimedia recibida de {msg.telefono} — respondido con aviso de solo texto")
+                continue
 
             # Obtener historial ANTES de guardar el mensaje actual
             historial = await obtener_historial(msg.telefono)
@@ -121,17 +138,16 @@ async def webhook_handler(request: Request):
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
-            # Sincronizar lead en Koala OS CRM (Supabase)
+            # Actualizar lead con resumen acumulativo de la conversación
             if _koala_cfg:
-                # Generar resumen de la conversación para el CRM (usa Haiku, rápido y barato)
                 historial_completo = await obtener_historial(msg.telefono)
                 resumen = await resumir_conversacion(historial_completo, msg.texto)
 
                 await upsert_lead_from_message(
                     cfg=_koala_cfg,
                     phone=msg.telefono,
-                    name=None,
-                    last_message=resumen,
+                    name=msg.nombre or None,
+                    last_message=msg.texto,
                     notas_internas=resumen,
                     conversation_id=msg.mensaje_id,
                 )

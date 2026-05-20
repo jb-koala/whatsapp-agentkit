@@ -19,12 +19,31 @@ class ProveedorTwilio(ProveedorWhatsApp):
         self.auth_token = os.getenv("TWILIO_AUTH_TOKEN")
         self.phone_number = os.getenv("TWILIO_PHONE_NUMBER")
 
+    # Mensaje cuando el cliente envía multimedia
+    MENSAJE_SOLO_TEXTO = (
+        "¡Gracias por tu mensaje! Por ahora solo puedo leer mensajes de texto. "
+        "¿Podrías escribirme lo que necesitás? Estoy acá para ayudarte."
+    )
+
     async def parsear_webhook(self, request: Request) -> list[MensajeEntrante]:
         """Parsea el payload form-encoded de Twilio."""
         form = await request.form()
         texto = form.get("Body", "")
         telefono = form.get("From", "").replace("whatsapp:", "")
         mensaje_id = form.get("MessageSid", "")
+        nombre = form.get("ProfileName", "")
+        num_media = int(form.get("NumMedia", "0"))
+
+        # Si envía multimedia sin texto, responder que solo acepta texto
+        if num_media > 0 and not texto.strip():
+            return [MensajeEntrante(
+                telefono=telefono,
+                texto="__MULTIMEDIA__",
+                mensaje_id=mensaje_id,
+                es_propio=False,
+                nombre=nombre,
+            )]
+
         if not texto:
             return []
         return [MensajeEntrante(
@@ -32,6 +51,7 @@ class ProveedorTwilio(ProveedorWhatsApp):
             texto=texto,
             mensaje_id=mensaje_id,
             es_propio=False,
+            nombre=nombre,
         )]
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:

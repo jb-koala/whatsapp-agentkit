@@ -18,6 +18,7 @@ class MensajeEntrante:
     texto: str          # Contenido del mensaje
     mensaje_id: str     # ID único del mensaje
     es_propio: bool     # True si lo envió el agente (se ignora)
+    nombre: str = ""    # Nombre/alias del contacto (ProfileName en Twilio)
 
 
 class ProveedorWhatsApp(ABC):
