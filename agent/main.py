@@ -15,7 +15,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from agent.brain import generar_respuesta
+from agent.brain import generar_respuesta, resumir_conversacion
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
 from agent.providers import obtener_proveedor
 from agent.koala_sync import KoalaSyncConfig, upsert_lead_from_message
@@ -123,12 +123,16 @@ async def webhook_handler(request: Request):
 
             # Sincronizar lead en Koala OS CRM (Supabase)
             if _koala_cfg:
+                # Generar resumen de la conversación para el CRM (usa Haiku, rápido y barato)
+                historial_completo = await obtener_historial(msg.telefono)
+                resumen = await resumir_conversacion(historial_completo, msg.texto)
+
                 await upsert_lead_from_message(
                     cfg=_koala_cfg,
                     phone=msg.telefono,
-                    name=None,  # Se completa cuando el cliente da su nombre
-                    last_message=msg.texto,
-                    notas_internas=f"Último mensaje procesado por Koala-OS",
+                    name=None,
+                    last_message=resumen,
+                    notas_internas=resumen,
                     conversation_id=msg.mensaje_id,
                 )
 

@@ -93,3 +93,41 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
     except Exception as e:
         logger.error(f"Error Claude API: {e}")
         return obtener_mensaje_error()
+
+
+async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> str:
+    """
+    Genera un resumen breve de la conversación para el CRM.
+    Extrae: intent, datos clave (nombre, personas, fecha, local, etc.)
+
+    Returns:
+        Resumen en 1-3 líneas para el campo ultimo_mensaje del CRM.
+    """
+    mensajes_texto = ""
+    for msg in historial[-10:]:  # Últimos 10 mensajes para no exceder contexto
+        rol = "Cliente" if msg["role"] == "user" else "Agente"
+        mensajes_texto += f"{rol}: {msg['content']}\n"
+    mensajes_texto += f"Cliente: {mensaje_actual}\n"
+
+    try:
+        response = await client.messages.create(
+            model="claude-haiku-3-5-20241022",
+            max_tokens=200,
+            system=(
+                "Sos un asistente que resume conversaciones de WhatsApp para un CRM de restaurantes. "
+                "Generá un resumen MUY breve (máximo 2-3 líneas) con los datos clave extraídos. "
+                "Formato: 'Intent: [reserva/consulta/evento/otro] · [datos clave separados por ·]'. "
+                "Ejemplos:\n"
+                "- 'Intent: reserva · 4 personas · sábado 21:00 · Palermo · cumpleaños'\n"
+                "- 'Intent: consulta · preguntas sobre menú sin TACC'\n"
+                "- 'Intent: evento corporativo · empresa TechCo · 30 personas · diciembre'\n"
+                "Si no hay datos concretos, resumí el tema general de la conversación."
+            ),
+            messages=[{"role": "user", "content": mensajes_texto}]
+        )
+        resumen = response.content[0].text.strip()
+        logger.info(f"Resumen CRM generado ({response.usage.input_tokens} in / {response.usage.output_tokens} out)")
+        return resumen
+    except Exception as e:
+        logger.error(f"Error generando resumen CRM: {e}")
+        return mensaje_actual[:500]
