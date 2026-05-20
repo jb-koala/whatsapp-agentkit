@@ -4,7 +4,7 @@
 > y sabe exactamente qué hacer para guiar al usuario a construir su agente de WhatsApp.
 > NO modificar manualmente a menos que sepas lo que haces.
 
-----
+---
 
 ## 1. Identidad del sistema
 
