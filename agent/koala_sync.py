@@ -154,5 +154,35 @@ async def upsert_lead_from_message(
             ins.raise_for_status()
             new_id = ins.json()[0]["id"] if ins.json() else "?"
             log.info("koala_sync: lead nuevo %s creado", new_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                # 409 Conflict: el lead existe pero no lo encontró el GET
+                # Fallback: buscar más amplio y hacer PATCH
+                log.info("koala_sync: 409 en INSERT, intentando PATCH por contacto")
+                try:
+                    patch_data = {
+                        "ultimo_mensaje": last_message[:500],
+                        "updated_at": "now()",
+                        "nombre": (name or phone)[:120],
+                    }
+                    if notas_internas:
+                        patch_data["notas_internas"] = notas_internas[:500]
+                    if etiquetas:
+                        patch_data["etiquetas"] = etiquetas
+                    detected_loc = detectar_local(last_message)
+                    if detected_loc:
+                        patch_data["location_id"] = detected_loc
+
+                    upd = await client.patch(
+                        f"{endpoint}?contacto=eq.{phone}",
+                        headers=headers,
+                        json=patch_data,
+                    )
+                    upd.raise_for_status()
+                    log.info("koala_sync: lead actualizado via fallback PATCH")
+                except httpx.HTTPError as patch_exc:
+                    log.warning("koala_sync: fallback PATCH también falló: %s", patch_exc)
+            else:
+                log.warning("koala_sync: fallo creando lead: %s", exc)
         except httpx.HTTPError as exc:
             log.warning("koala_sync: fallo creando lead: %s", exc)

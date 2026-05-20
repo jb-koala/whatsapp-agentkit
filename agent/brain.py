@@ -137,13 +137,21 @@ async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> di
             messages=[{"role": "user", "content": mensajes_texto}]
         )
         import json
+        import re
         texto = response.content[0].text.strip()
         logger.info(f"Resumen CRM generado ({response.usage.input_tokens} in / {response.usage.output_tokens} out)")
-        resultado = json.loads(texto)
-        return {
-            "resumen": resultado.get("resumen", mensaje_actual[:500]),
-            "etiquetas": resultado.get("etiquetas", []),
-        }
+
+        # Extraer JSON del texto (Haiku a veces agrega texto antes/después)
+        json_match = re.search(r'\{.*\}', texto, re.DOTALL)
+        if json_match:
+            resultado = json.loads(json_match.group())
+            return {
+                "resumen": resultado.get("resumen", mensaje_actual[:500]),
+                "etiquetas": resultado.get("etiquetas", []),
+            }
+        else:
+            logger.warning(f"Haiku no devolvió JSON válido: {texto[:200]}")
+            return {"resumen": texto[:500], "etiquetas": []}
     except Exception as e:
         logger.error(f"Error generando resumen CRM: {e}")
         return {"resumen": mensaje_actual[:500], "etiquetas": []}
