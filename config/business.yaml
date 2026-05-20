@@ -1,0 +1,36 @@
+# Configuración del negocio — Generado por AgentKit
+negocio:
+  nombre: "Koala"
+  descripcion: >
+    Koala es una cadena de restaurantes casual premium con presencia en el AMBA (Argentina).
+    Combina sabores australianos y locales con prácticas sustentables.
+    Foco en pastas, propuesta gastronómica de autor, brunch los fines de semana,
+    maridajes, noches de degustación, terraza con DJ, happy hour, eventos corporativos y catering.
+  locales:
+    - nombre: "Koala Pilar"
+      direccion: "Km 50, Ramal Pilar — Buenos Aires"
+      capacidad: 85
+      estado: "abierto"
+    - nombre: "Koala Palermo"
+      direccion: "Guatemala 4800, CABA"
+      capacidad: 72
+      estado: "abierto"
+    - nombre: "Koala Puerto Madero"
+      direccion: "Av. Alicia Moreau de Justo"
+      capacidad: 110
+      estado: "próxima apertura"
+  horario: "Lunes a jueves 7:30am a 11pm, Viernes y Sábados 8am a 12am, Domingos 7:30am a 11pm"
+  zona_horaria: "America/Argentina/Buenos_Aires"
+  idioma: "es-AR"
+
+agente:
+  nombre: "Koala-OS"
+  tono: "Amigable y casual"
+  casos_de_uso:
+    - "Responder preguntas frecuentes"
+    - "Agendar reservaciones"
+    - "Calificar y atender leads / ventas"
+
+metadata:
+  creado: "2026-05-20"
+  version: "1.0"
