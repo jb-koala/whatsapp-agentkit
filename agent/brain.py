@@ -110,7 +110,7 @@ async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> di
 
     try:
         response = await client.messages.create(
-            model="claude-haiku-3-5-20241022",
+            model="claude-haiku-4-5-20251001",
             max_tokens=250,
             system=(
                 "Sos un asistente que analiza conversaciones de WhatsApp para un CRM de restaurantes. "

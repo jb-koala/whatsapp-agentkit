@@ -70,7 +70,6 @@ async def upsert_lead_from_message(
     name: Optional[str],
     last_message: str,
     notas_internas: str = "",
-    conversation_id: str = "",
     location_id: Optional[str] = None,
     etiquetas: Optional[list[str]] = None,
 ) -> None:
@@ -107,10 +106,6 @@ async def upsert_lead_from_message(
     }
     if etiquetas:
         payload["etiquetas"] = etiquetas
-    # Solo incluir id_conversacion_canal si es un ID real (no vacío)
-    # para evitar conflictos con el unique index parcial
-    if conversation_id and conversation_id.strip():
-        payload["id_conversacion_canal"] = conversation_id.strip()
 
     async with httpx.AsyncClient(timeout=10) as client:
         # 1) Buscar si ya existe un lead con ese teléfono

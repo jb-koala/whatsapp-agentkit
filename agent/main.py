@@ -118,7 +118,6 @@ async def webhook_handler(request: Request):
                     phone=msg.telefono,
                     name=msg.nombre or None,
                     last_message=msg.texto,
-                    conversation_id=msg.mensaje_id,
                 )
 
             # Si es multimedia, responder que solo acepta texto (sin llamar a Claude)
@@ -150,7 +149,6 @@ async def webhook_handler(request: Request):
                     last_message=msg.texto,
                     notas_internas=analisis["resumen"],
                     etiquetas=analisis["etiquetas"],
-                    conversation_id=msg.mensaje_id,
                 )
 
             # Enviar respuesta por WhatsApp via el proveedor
