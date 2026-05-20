@@ -72,6 +72,7 @@ async def upsert_lead_from_message(
     notas_internas: str = "",
     conversation_id: str = "",
     location_id: Optional[str] = None,
+    etiquetas: Optional[list[str]] = None,
 ) -> None:
     """Crea o actualiza un lead en crm_leads a partir de un mensaje entrante.
 
@@ -104,6 +105,8 @@ async def upsert_lead_from_message(
         "fuente_detalle": cfg.lead_source,
         "notas_internas": notas_internas[:500],
     }
+    if etiquetas:
+        payload["etiquetas"] = etiquetas
     # Solo incluir id_conversacion_canal si es un ID real (no vacío)
     # para evitar conflictos con el unique index parcial
     if conversation_id and conversation_id.strip():
@@ -136,6 +139,8 @@ async def upsert_lead_from_message(
                 patch_data["location_id"] = detected_loc
             if notas_internas:
                 patch_data["notas_internas"] = notas_internas[:500]
+            if etiquetas:
+                patch_data["etiquetas"] = etiquetas
             try:
                 upd = await client.patch(
                     f"{endpoint}?id=eq.{lead_id}",

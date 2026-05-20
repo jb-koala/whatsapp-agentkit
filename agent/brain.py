@@ -95,13 +95,12 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
         return obtener_mensaje_error()
 
 
-async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> str:
+async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> dict:
     """
-    Genera un resumen breve de la conversación para el CRM.
-    Extrae: intent, datos clave (nombre, personas, fecha, local, etc.)
+    Genera un resumen breve de la conversación y etiquetas para el CRM.
 
     Returns:
-        Resumen en 1-3 líneas para el campo ultimo_mensaje del CRM.
+        Dict con "resumen" (str) y "etiquetas" (list[str]).
     """
     mensajes_texto = ""
     for msg in historial[-10:]:  # Últimos 10 mensajes para no exceder contexto
@@ -112,22 +111,39 @@ async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> st
     try:
         response = await client.messages.create(
             model="claude-haiku-3-5-20241022",
-            max_tokens=200,
+            max_tokens=250,
             system=(
-                "Sos un asistente que resume conversaciones de WhatsApp para un CRM de restaurantes. "
-                "Generá un resumen MUY breve (máximo 2-3 líneas) con los datos clave extraídos. "
-                "Formato: 'Intent: [reserva/consulta/evento/otro] · [datos clave separados por ·]'. "
+                "Sos un asistente que analiza conversaciones de WhatsApp para un CRM de restaurantes. "
+                "Respondé SOLO con un JSON válido, sin texto adicional.\n\n"
+                "Formato:\n"
+                '{"resumen": "...", "etiquetas": [...]}\n\n'
+                "Reglas para el resumen:\n"
+                "- Máximo 2-3 líneas con datos clave separados por ·\n"
+                "- Incluí: intent, personas, fecha, hora, local, nombre si lo dio\n"
+                "- Ejemplo: \"Reserva · 4 personas · sábado 21:00 · Palermo · cumpleaños\"\n\n"
+                "Reglas para las etiquetas:\n"
+                "- SOLO usá estas etiquetas válidas: reserva, consulta, evento\n"
+                "- reserva: el cliente quiere reservar mesa\n"
+                "- consulta: pregunta sobre menú, horarios, locales, precios, opciones\n"
+                "- evento: evento corporativo, catering, cumpleaños, celebración privada\n"
+                "- Podés asignar más de una si aplica (ej: consulta + reserva)\n"
+                "- Si no encaja en ninguna, dejá el array vacío []\n\n"
                 "Ejemplos:\n"
-                "- 'Intent: reserva · 4 personas · sábado 21:00 · Palermo · cumpleaños'\n"
-                "- 'Intent: consulta · preguntas sobre menú sin TACC'\n"
-                "- 'Intent: evento corporativo · empresa TechCo · 30 personas · diciembre'\n"
-                "Si no hay datos concretos, resumí el tema general de la conversación."
+                '{"resumen": "Reserva · 4 personas · sábado 21:00 · Palermo", "etiquetas": ["reserva"]}\n'
+                '{"resumen": "Consulta sobre opciones sin TACC y precios de brunch", "etiquetas": ["consulta"]}\n'
+                '{"resumen": "Evento corporativo · empresa TechCo · 30 personas · diciembre · Pilar", "etiquetas": ["evento"]}\n'
+                '{"resumen": "Reserva para cumpleaños · 12 personas · consulta menú cerrado", "etiquetas": ["reserva", "evento"]}'
             ),
             messages=[{"role": "user", "content": mensajes_texto}]
         )
-        resumen = response.content[0].text.strip()
+        import json
+        texto = response.content[0].text.strip()
         logger.info(f"Resumen CRM generado ({response.usage.input_tokens} in / {response.usage.output_tokens} out)")
-        return resumen
+        resultado = json.loads(texto)
+        return {
+            "resumen": resultado.get("resumen", mensaje_actual[:500]),
+            "etiquetas": resultado.get("etiquetas", []),
+        }
     except Exception as e:
         logger.error(f"Error generando resumen CRM: {e}")
-        return mensaje_actual[:500]
+        return {"resumen": mensaje_actual[:500], "etiquetas": []}

@@ -138,17 +138,18 @@ async def webhook_handler(request: Request):
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
-            # Actualizar lead con resumen acumulativo de la conversación
+            # Actualizar lead con resumen acumulativo y etiquetas
             if _koala_cfg:
                 historial_completo = await obtener_historial(msg.telefono)
-                resumen = await resumir_conversacion(historial_completo, msg.texto)
+                analisis = await resumir_conversacion(historial_completo, msg.texto)
 
                 await upsert_lead_from_message(
                     cfg=_koala_cfg,
                     phone=msg.telefono,
                     name=msg.nombre or None,
                     last_message=msg.texto,
-                    notas_internas=resumen,
+                    notas_internas=analisis["resumen"],
+                    etiquetas=analisis["etiquetas"],
                     conversation_id=msg.mensaje_id,
                 )
 
