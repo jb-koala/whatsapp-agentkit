@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from agent.brain import generar_respuesta, resumir_conversacion
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
 from agent.providers import obtener_proveedor
-from agent.koala_sync import KoalaSyncConfig, upsert_lead_from_message
+from agent.koala_sync import KoalaSyncConfig, upsert_lead_from_message, append_wa_message
 
 load_dotenv()
 
@@ -111,19 +111,47 @@ async def webhook_handler(request: Request):
 
             logger.info(f"Mensaje de {msg.telefono} ({msg.nombre}): {msg.texto}")
 
+            # Nombre del proveedor para registrar en wa_conversations
+            proveedor_nombre = os.getenv("WHATSAPP_PROVIDER", "twilio").lower() or "twilio"
+
             # Crear/actualizar lead en CRM inmediatamente con teléfono y alias
+            lead_id = None
             if _koala_cfg:
-                await upsert_lead_from_message(
+                lead_id = await upsert_lead_from_message(
                     cfg=_koala_cfg,
                     phone=msg.telefono,
                     name=msg.nombre or None,
                     last_message=msg.texto,
                 )
 
+                # Registrar mensaje entrante del usuario en wa_conversations
+                if msg.texto != "__MULTIMEDIA__":
+                    await append_wa_message(
+                        cfg=_koala_cfg,
+                        phone=msg.telefono,
+                        role="user",
+                        content=msg.texto,
+                        proveedor=proveedor_nombre,
+                        provider_msg_id=msg.mensaje_id or None,
+                        contacto_nombre=msg.nombre or None,
+                        lead_id=lead_id,
+                    )
+
             # Si es multimedia, responder que solo acepta texto (sin llamar a Claude)
             if msg.texto == "__MULTIMEDIA__":
                 from agent.providers.twilio import ProveedorTwilio
-                await proveedor.enviar_mensaje(msg.telefono, ProveedorTwilio.MENSAJE_SOLO_TEXTO)
+                aviso = ProveedorTwilio.MENSAJE_SOLO_TEXTO
+                await proveedor.enviar_mensaje(msg.telefono, aviso)
+                if _koala_cfg:
+                    await append_wa_message(
+                        cfg=_koala_cfg,
+                        phone=msg.telefono,
+                        role="bot",
+                        content=aviso,
+                        proveedor=proveedor_nombre,
+                        contacto_nombre=msg.nombre or None,
+                        lead_id=lead_id,
+                    )
                 logger.info(f"Multimedia recibida de {msg.telefono} — respondido con aviso de solo texto")
                 continue
 
@@ -153,6 +181,18 @@ async def webhook_handler(request: Request):
 
             # Enviar respuesta por WhatsApp via el proveedor
             await proveedor.enviar_mensaje(msg.telefono, respuesta)
+
+            # Registrar respuesta del bot en wa_conversations
+            if _koala_cfg:
+                await append_wa_message(
+                    cfg=_koala_cfg,
+                    phone=msg.telefono,
+                    role="bot",
+                    content=respuesta,
+                    proveedor=proveedor_nombre,
+                    contacto_nombre=msg.nombre or None,
+                    lead_id=lead_id,
+                )
 
             logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
 
