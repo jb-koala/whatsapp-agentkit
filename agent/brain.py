@@ -95,63 +95,159 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
         return obtener_mensaje_error()
 
 
-async def resumir_conversacion(historial: list[dict], mensaje_actual: str) -> dict:
-    """
-    Genera un resumen breve de la conversación y etiquetas para el CRM.
+# Valores válidos para `intent` y `intent_status`.
+# Se mantienen en sintonía con la documentación de Koala OS
+# (migración 41_crm_leads_intent.sql).
+_INTENTS_VALIDOS = {
+    "indefinido",
+    "reserva",
+    "cancelacion",
+    "consulta",
+    "queja",
+    "evento",
+    "otro",
+}
+_STATUS_VALIDOS = {"abierto", "confirmado", "perdido", "cerrado"}
 
-    Returns:
-        Dict con "resumen" (str) y "etiquetas" (list[str]).
+
+async def resumir_conversacion(
+    historial: list[dict],
+    mensaje_actual: str,
+    intent_actual: str | None = None,
+) -> dict:
+    """Resumen + clasificación de intent de la conversación.
+
+    Devuelve un dict con:
+      * resumen (str)                — 2-3 líneas para `crm_leads.notas_internas`.
+      * etiquetas (list[str])        — texto libre, usado como tags.
+      * intent (str)                 — categoría operativa (ver `_INTENTS_VALIDOS`).
+      * intent_status (str)          — estado del intent (ver `_STATUS_VALIDOS`).
+      * intent_changed (bool)        — opinión del LLM: ¿cambió respecto al
+                                        intent vigente del lead?
+      * resumen_intent (str)         — resumen específico de ESTE intent
+                                        (sin contaminar con anteriores).
+
+    El parámetro `intent_actual` indica al LLM cuál era el intent del lead
+    abierto, así puede comparar y decir si cambió.
     """
     mensajes_texto = ""
-    for msg in historial[-10:]:  # Últimos 10 mensajes para no exceder contexto
+    for msg in historial[-12:]:
         rol = "Cliente" if msg["role"] == "user" else "Agente"
         mensajes_texto += f"{rol}: {msg['content']}\n"
     mensajes_texto += f"Cliente: {mensaje_actual}\n"
 
+    intent_actual_norm = (intent_actual or "indefinido").lower().strip()
+
     try:
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=250,
+            max_tokens=400,
             system=(
                 "Sos un asistente que analiza conversaciones de WhatsApp para un CRM de restaurantes. "
                 "Respondé SOLO con un JSON válido, sin texto adicional.\n\n"
-                "Formato:\n"
-                '{"resumen": "...", "etiquetas": [...]}\n\n'
-                "Reglas para el resumen:\n"
-                "- Máximo 2-3 líneas con datos clave separados por ·\n"
-                "- Incluí: intent, personas, fecha, hora, local, nombre si lo dio\n"
-                "- Ejemplo: \"Reserva · 4 personas · sábado 21:00 · Palermo · cumpleaños\"\n\n"
-                "Reglas para las etiquetas:\n"
-                "- SOLO usá estas etiquetas válidas: reserva, consulta, evento\n"
-                "- reserva: el cliente quiere reservar mesa\n"
-                "- consulta: pregunta sobre menú, horarios, locales, precios, opciones\n"
-                "- evento: evento corporativo, catering, cumpleaños, celebración privada\n"
-                "- Podés asignar más de una si aplica (ej: consulta + reserva)\n"
-                "- Si no encaja en ninguna, dejá el array vacío []\n\n"
-                "Ejemplos:\n"
-                '{"resumen": "Reserva · 4 personas · sábado 21:00 · Palermo", "etiquetas": ["reserva"]}\n'
-                '{"resumen": "Consulta sobre opciones sin TACC y precios de brunch", "etiquetas": ["consulta"]}\n'
-                '{"resumen": "Evento corporativo · empresa TechCo · 30 personas · diciembre · Pilar", "etiquetas": ["evento"]}\n'
-                '{"resumen": "Reserva para cumpleaños · 12 personas · consulta menú cerrado", "etiquetas": ["reserva", "evento"]}'
+                "Formato exacto:\n"
+                '{"resumen": "...", "etiquetas": [...], "intent": "...", '
+                '"intent_status": "...", "intent_changed": false, "resumen_intent": "..."}\n\n'
+                "Reglas para `resumen` (resumen general de toda la conv):\n"
+                "- 2-3 líneas con los datos clave separados por ·\n"
+                "- Incluí: tipo de pedido, personas, fecha, hora, local, nombre si lo dio\n\n"
+                "Reglas para `etiquetas` (texto libre, sin tildes ni mayúsculas):\n"
+                "- 1-3 tags. Ej: reserva, cancelacion, consulta, evento, queja, cumpleanos\n\n"
+                "Reglas para `intent` (ELEGÍ UNA SOLA de esta lista cerrada):\n"
+                "- indefinido: saludo, hola, hi, sin información todavía\n"
+                "- reserva: quiere reservar mesa o ya está reservando\n"
+                "- cancelacion: quiere cancelar, mover o modificar una reserva existente\n"
+                "- consulta: pregunta puntual (horarios, menú, ubicación, opciones)\n"
+                "- queja: reclamo, mala experiencia, comida fría, mal trato\n"
+                "- evento: evento corporativo, catering, fiesta privada, salón cerrado\n"
+                "- otro: nada de lo anterior\n\n"
+                "Reglas para `intent_status`:\n"
+                "- abierto: el intent está en curso (todavía falta confirmar o info)\n"
+                "- confirmado: ya quedó cerrado con éxito (reserva confirmada, evento agendado)\n"
+                "- perdido: el cliente se arrepintió, no se concretó, canceló sin reemplazo\n"
+                "- cerrado: la consulta terminó sin acción pendiente\n\n"
+                "Reglas para `intent_changed`:\n"
+                "- true: el intent NUEVO de esta conversación es DISTINTO al que ya tenía "
+                "(intent_actual). Por ejemplo: pasó de 'reserva' a 'cancelacion', o de "
+                "'indefinido' a 'reserva'.\n"
+                "- false: sigue siendo el mismo intent que ya tenía.\n\n"
+                "Reglas para `resumen_intent`:\n"
+                "- Resumen específico SOLO del intent actual (no del histórico).\n"
+                "- Si intent_changed=true, este resumen describe el intent NUEVO solamente.\n\n"
+                f"intent_actual del lead abierto: '{intent_actual_norm}'\n"
             ),
-            messages=[{"role": "user", "content": mensajes_texto}]
+            messages=[{"role": "user", "content": mensajes_texto}],
         )
         import json
         import re
         texto = response.content[0].text.strip()
-        logger.info(f"Resumen CRM generado ({response.usage.input_tokens} in / {response.usage.output_tokens} out)")
+        logger.info(
+            f"Resumen CRM generado ({response.usage.input_tokens} in / "
+            f"{response.usage.output_tokens} out)"
+        )
 
-        # Extraer JSON del texto (Haiku a veces agrega texto antes/después)
-        json_match = re.search(r'\{.*\}', texto, re.DOTALL)
-        if json_match:
-            resultado = json.loads(json_match.group())
-            return {
-                "resumen": resultado.get("resumen", mensaje_actual[:500]),
-                "etiquetas": resultado.get("etiquetas", []),
-            }
-        else:
+        json_match = re.search(r"\{.*\}", texto, re.DOTALL)
+        if not json_match:
             logger.warning(f"Haiku no devolvió JSON válido: {texto[:200]}")
-            return {"resumen": texto[:500], "etiquetas": []}
+            return _resumen_fallback(mensaje_actual, intent_actual_norm)
+
+        try:
+            raw = json.loads(json_match.group())
+        except json.JSONDecodeError as exc:
+            logger.warning(f"JSON inválido del resumen: {exc} — {texto[:200]}")
+            return _resumen_fallback(mensaje_actual, intent_actual_norm)
+
+        intent = (raw.get("intent") or "indefinido").lower().strip()
+        if intent not in _INTENTS_VALIDOS:
+            intent = "otro"
+
+        status = (raw.get("intent_status") or "abierto").lower().strip()
+        if status not in _STATUS_VALIDOS:
+            status = "abierto"
+
+        changed = bool(raw.get("intent_changed", False))
+        # Sanitizar: si el LLM dice changed=true pero el intent es el mismo,
+        # forzar false. Y viceversa.
+        if intent == intent_actual_norm:
+            changed = False
+        elif intent != intent_actual_norm and intent_actual_norm not in ("", "indefinido"):
+            # Promoción de 'indefinido' a un intent definido NO se considera
+            # "cambio" — es el primer intent claro. Cualquier otro cambio sí.
+            changed = True
+        else:
+            # intent_actual era indefinido y ahora hay uno definido: NO crear
+            # un lead nuevo, simplemente actualizar el existente.
+            changed = False
+
+        etiquetas = raw.get("etiquetas") or []
+        if not isinstance(etiquetas, list):
+            etiquetas = []
+        etiquetas = [str(t).strip().lower() for t in etiquetas if str(t).strip()]
+
+        resumen = str(raw.get("resumen") or mensaje_actual)[:500]
+        resumen_intent = str(raw.get("resumen_intent") or resumen)[:500]
+
+        return {
+            "resumen": resumen,
+            "etiquetas": etiquetas,
+            "intent": intent,
+            "intent_status": status,
+            "intent_changed": changed,
+            "resumen_intent": resumen_intent,
+        }
+
     except Exception as e:
         logger.error(f"Error generando resumen CRM: {e}")
-        return {"resumen": mensaje_actual[:500], "etiquetas": []}
+        return _resumen_fallback(mensaje_actual, intent_actual_norm)
+
+
+def _resumen_fallback(mensaje_actual: str, intent_actual: str) -> dict:
+    """Resumen mínimo cuando Claude falla o devuelve algo inválido."""
+    return {
+        "resumen": mensaje_actual[:500],
+        "etiquetas": [],
+        "intent": intent_actual if intent_actual in _INTENTS_VALIDOS else "indefinido",
+        "intent_status": "abierto",
+        "intent_changed": False,
+        "resumen_intent": mensaje_actual[:500],
+    }

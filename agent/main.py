@@ -18,7 +18,12 @@ from dotenv import load_dotenv
 from agent.brain import generar_respuesta, resumir_conversacion
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
 from agent.providers import obtener_proveedor
-from agent.koala_sync import KoalaSyncConfig, upsert_lead_from_message, append_wa_message
+from agent.koala_sync import (
+    KoalaSyncConfig,
+    upsert_lead_from_message,
+    append_wa_message,
+    find_open_lead as koala_find_open_lead,
+)
 
 load_dotenv()
 
@@ -117,7 +122,9 @@ async def webhook_handler(request: Request):
             # ─────────────────────────────────────────────────────────────
             # FASE 1: PERSISTENCIA DEL USER MESSAGE
             # Lo más importante: nunca perder un mensaje del cliente.
-            # Cualquier fallo posterior no debe romper este registro.
+            # En este punto NO conocemos todavía el intent (lo calcula
+            # Claude después), así que el lead arranca/sigue con
+            # `intent="indefinido"` y se promueve en la fase 4.
             # ─────────────────────────────────────────────────────────────
             lead_id = None
             if _koala_cfg:
@@ -213,16 +220,47 @@ async def webhook_handler(request: Request):
             logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
 
             # ─────────────────────────────────────────────────────────────
-            # FASE 4: ANÁLISIS / RESUMEN (best-effort, no bloquea)
-            # Si Claude tira excepción acá, no afecta a la conversación
-            # ya persistida en fases anteriores.
+            # FASE 4: ANÁLISIS / RESUMEN + CLASIFICACIÓN DE INTENT
+            #
+            # Claude analiza el historial completo y declara:
+            #   * intent (reserva / cancelacion / consulta / queja / evento)
+            #   * intent_status (abierto / confirmado / perdido / cerrado)
+            #   * intent_changed (¿cambió respecto al lead abierto?)
+            #
+            # Si cambió el intent, koala_sync cierra el lead viejo (estado
+            # ganado/perdido según el status) y abre uno nuevo. Si el lead
+            # llevaba mucho sin actividad (intent_timeout_min), se trata
+            # como sesión nueva aunque el intent sea el mismo.
+            #
+            # Best-effort: si Claude tira excepción acá, no afecta a la
+            # conversación ya persistida en fases anteriores.
             # ─────────────────────────────────────────────────────────────
             if _koala_cfg:
                 try:
                     historial_completo = await obtener_historial(msg.telefono)
-                    analisis = await resumir_conversacion(historial_completo, msg.texto)
-                    resumen = (analisis or {}).get("resumen", "") if isinstance(analisis, dict) else ""
-                    etiquetas_an = (analisis or {}).get("etiquetas", []) if isinstance(analisis, dict) else []
+                    # Pasamos el intent del lead abierto para que Claude
+                    # decida si efectivamente cambió.
+                    open_lead = await koala_find_open_lead(_koala_cfg, msg.telefono)
+                    intent_actual = (open_lead or {}).get("intent") or "indefinido"
+
+                    analisis = await resumir_conversacion(
+                        historial_completo,
+                        msg.texto,
+                        intent_actual=intent_actual,
+                    )
+                    analisis = analisis if isinstance(analisis, dict) else {}
+                    resumen = analisis.get("resumen", "") or ""
+                    etiquetas_an = analisis.get("etiquetas", []) or []
+                    intent_an = analisis.get("intent", "indefinido")
+                    status_an = analisis.get("intent_status", "abierto")
+                    changed_an = bool(analisis.get("intent_changed", False))
+                    resumen_intent = analisis.get("resumen_intent", resumen) or resumen
+
+                    logger.info(
+                        "intent_analysis: actual=%s nuevo=%s status=%s changed=%s",
+                        intent_actual, intent_an, status_an, changed_an,
+                    )
+
                     await upsert_lead_from_message(
                         cfg=_koala_cfg,
                         phone=msg.telefono,
@@ -230,6 +268,10 @@ async def webhook_handler(request: Request):
                         last_message=msg.texto,
                         notas_internas=resumen,
                         etiquetas=etiquetas_an,
+                        intent=intent_an,
+                        intent_status=status_an,
+                        intent_changed=changed_an,
+                        resumen_intent=resumen_intent,
                     )
                 except Exception as exc:
                     logger.warning("resumen / upsert (post) falló: %s", exc)
