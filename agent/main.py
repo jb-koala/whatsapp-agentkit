@@ -114,87 +114,125 @@ async def webhook_handler(request: Request):
             # Nombre del proveedor para registrar en wa_conversations
             proveedor_nombre = os.getenv("WHATSAPP_PROVIDER", "twilio").lower() or "twilio"
 
-            # Crear/actualizar lead en CRM inmediatamente con teléfono y alias
+            # ─────────────────────────────────────────────────────────────
+            # FASE 1: PERSISTENCIA DEL USER MESSAGE
+            # Lo más importante: nunca perder un mensaje del cliente.
+            # Cualquier fallo posterior no debe romper este registro.
+            # ─────────────────────────────────────────────────────────────
             lead_id = None
             if _koala_cfg:
-                lead_id = await upsert_lead_from_message(
-                    cfg=_koala_cfg,
-                    phone=msg.telefono,
-                    name=msg.nombre or None,
-                    last_message=msg.texto,
-                )
-
-                # Registrar mensaje entrante del usuario en wa_conversations
-                if msg.texto != "__MULTIMEDIA__":
-                    await append_wa_message(
+                try:
+                    lead_id = await upsert_lead_from_message(
                         cfg=_koala_cfg,
                         phone=msg.telefono,
-                        role="user",
-                        content=msg.texto,
-                        proveedor=proveedor_nombre,
-                        provider_msg_id=msg.mensaje_id or None,
-                        contacto_nombre=msg.nombre or None,
-                        lead_id=lead_id,
+                        name=msg.nombre or None,
+                        last_message=msg.texto,
                     )
+                except Exception as exc:
+                    logger.warning("upsert_lead (user) falló: %s", exc)
 
-            # Si es multimedia, responder que solo acepta texto (sin llamar a Claude)
+                if msg.texto != "__MULTIMEDIA__":
+                    try:
+                        await append_wa_message(
+                            cfg=_koala_cfg,
+                            phone=msg.telefono,
+                            role="user",
+                            content=msg.texto,
+                            proveedor=proveedor_nombre,
+                            provider_msg_id=msg.mensaje_id or None,
+                            contacto_nombre=msg.nombre or None,
+                            lead_id=lead_id,
+                        )
+                    except Exception as exc:
+                        logger.warning("append_wa_message (user) falló: %s", exc)
+
+            # ─────────────────────────────────────────────────────────────
+            # FASE 2: MULTIMEDIA SHORT-CIRCUIT
+            # ─────────────────────────────────────────────────────────────
             if msg.texto == "__MULTIMEDIA__":
                 from agent.providers.twilio import ProveedorTwilio
                 aviso = ProveedorTwilio.MENSAJE_SOLO_TEXTO
-                await proveedor.enviar_mensaje(msg.telefono, aviso)
+                try:
+                    await proveedor.enviar_mensaje(msg.telefono, aviso)
+                except Exception as exc:
+                    logger.warning("enviar_mensaje (multimedia) falló: %s", exc)
                 if _koala_cfg:
+                    try:
+                        await append_wa_message(
+                            cfg=_koala_cfg,
+                            phone=msg.telefono,
+                            role="bot",
+                            content=aviso,
+                            proveedor=proveedor_nombre,
+                            contacto_nombre=msg.nombre or None,
+                            lead_id=lead_id,
+                        )
+                    except Exception as exc:
+                        logger.warning("append_wa_message (multimedia bot) falló: %s", exc)
+                logger.info(f"Multimedia recibida de {msg.telefono} — respondido con aviso de solo texto")
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # FASE 3: GENERACIÓN DE RESPUESTA + PERSISTENCIA INMEDIATA
+            # El append del bot ocurre ANTES de cualquier análisis adicional
+            # para garantizar que nunca se pierda la conversación, aunque
+            # falle el resumen o Twilio.
+            # ─────────────────────────────────────────────────────────────
+            historial = await obtener_historial(msg.telefono)
+            respuesta = await generar_respuesta(msg.texto, historial)
+
+            # Memoria local del agente (SQLite)
+            try:
+                await guardar_mensaje(msg.telefono, "user", msg.texto)
+                await guardar_mensaje(msg.telefono, "assistant", respuesta)
+            except Exception as exc:
+                logger.warning("guardar_mensaje (SQLite local) falló: %s", exc)
+
+            # 3a — Registrar la respuesta del bot ANTES de mandarla por Twilio
+            # (si Twilio falla, igual queda registro en Koala OS).
+            if _koala_cfg:
+                try:
                     await append_wa_message(
                         cfg=_koala_cfg,
                         phone=msg.telefono,
                         role="bot",
-                        content=aviso,
+                        content=respuesta,
                         proveedor=proveedor_nombre,
                         contacto_nombre=msg.nombre or None,
                         lead_id=lead_id,
                     )
-                logger.info(f"Multimedia recibida de {msg.telefono} — respondido con aviso de solo texto")
-                continue
+                except Exception as exc:
+                    logger.warning("append_wa_message (bot) falló: %s", exc)
 
-            # Obtener historial ANTES de guardar el mensaje actual
-            historial = await obtener_historial(msg.telefono)
-
-            # Generar respuesta con Claude
-            respuesta = await generar_respuesta(msg.texto, historial)
-
-            # Guardar mensaje del usuario Y respuesta del agente en memoria
-            await guardar_mensaje(msg.telefono, "user", msg.texto)
-            await guardar_mensaje(msg.telefono, "assistant", respuesta)
-
-            # Actualizar lead con resumen acumulativo y etiquetas
-            if _koala_cfg:
-                historial_completo = await obtener_historial(msg.telefono)
-                analisis = await resumir_conversacion(historial_completo, msg.texto)
-
-                await upsert_lead_from_message(
-                    cfg=_koala_cfg,
-                    phone=msg.telefono,
-                    name=msg.nombre or None,
-                    last_message=msg.texto,
-                    notas_internas=analisis["resumen"],
-                    etiquetas=analisis["etiquetas"],
-                )
-
-            # Enviar respuesta por WhatsApp via el proveedor
-            await proveedor.enviar_mensaje(msg.telefono, respuesta)
-
-            # Registrar respuesta del bot en wa_conversations
-            if _koala_cfg:
-                await append_wa_message(
-                    cfg=_koala_cfg,
-                    phone=msg.telefono,
-                    role="bot",
-                    content=respuesta,
-                    proveedor=proveedor_nombre,
-                    contacto_nombre=msg.nombre or None,
-                    lead_id=lead_id,
-                )
+            # 3b — Enviar por WhatsApp
+            try:
+                await proveedor.enviar_mensaje(msg.telefono, respuesta)
+            except Exception as exc:
+                logger.warning("enviar_mensaje (bot) falló: %s", exc)
 
             logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
+
+            # ─────────────────────────────────────────────────────────────
+            # FASE 4: ANÁLISIS / RESUMEN (best-effort, no bloquea)
+            # Si Claude tira excepción acá, no afecta a la conversación
+            # ya persistida en fases anteriores.
+            # ─────────────────────────────────────────────────────────────
+            if _koala_cfg:
+                try:
+                    historial_completo = await obtener_historial(msg.telefono)
+                    analisis = await resumir_conversacion(historial_completo, msg.texto)
+                    resumen = (analisis or {}).get("resumen", "") if isinstance(analisis, dict) else ""
+                    etiquetas_an = (analisis or {}).get("etiquetas", []) if isinstance(analisis, dict) else []
+                    await upsert_lead_from_message(
+                        cfg=_koala_cfg,
+                        phone=msg.telefono,
+                        name=msg.nombre or None,
+                        last_message=msg.texto,
+                        notas_internas=resumen,
+                        etiquetas=etiquetas_an,
+                    )
+                except Exception as exc:
+                    logger.warning("resumen / upsert (post) falló: %s", exc)
 
         return {"status": "ok"}
 

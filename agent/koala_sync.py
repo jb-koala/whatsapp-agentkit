@@ -9,6 +9,7 @@ Usa upsert por teléfono para evitar duplicados.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -17,6 +18,13 @@ from typing import Optional
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Retries / timeouts globales para llamadas a Supabase REST.
+# Más altos que el default porque un mensaje perdido es peor que
+# un webhook lento.
+_HTTP_TIMEOUT_S = 20.0
+_HTTP_RETRIES = 3
+_HTTP_BACKOFF_BASE_S = 0.6
 
 
 # Mapeo de locales disponibles
@@ -260,13 +268,48 @@ async def append_wa_message(
     if lead_id:
         payload["p_lead_id"] = lead_id
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(endpoint, headers=headers, json=payload)
-            r.raise_for_status()
-            conv_id = r.json() if r.content else None
-            log.info("wa_append_message: %s conv=%s", role, conv_id)
-            return conv_id
-    except httpx.HTTPError as exc:
-        log.warning("wa_append_message: fallo (%s): %s", role, exc)
-        return None
+    # Retries con backoff exponencial: queremos NUNCA perder un mensaje
+    # porque Supabase pestañeó. Solo se reintenta ante errores de red /
+    # 5xx. 4xx (request mal formado) no se reintentan.
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, _HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
+                r = await client.post(endpoint, headers=headers, json=payload)
+                if 500 <= r.status_code < 600:
+                    last_exc = httpx.HTTPStatusError(
+                        f"Supabase {r.status_code}: {r.text[:200]}",
+                        request=r.request,
+                        response=r,
+                    )
+                    log.warning(
+                        "wa_append_message: 5xx en intento %d/%d (%s): %s",
+                        attempt, _HTTP_RETRIES, role, r.text[:200],
+                    )
+                else:
+                    r.raise_for_status()
+                    conv_id = r.json() if r.content else None
+                    log.info("wa_append_message: %s conv=%s", role, conv_id)
+                    return conv_id
+        except httpx.HTTPStatusError as exc:
+            # 4xx no se reintenta (payload mal formado, RLS, etc.)
+            log.warning(
+                "wa_append_message: HTTP %s (%s) en intento %d, no se reintenta: %s",
+                exc.response.status_code, role, attempt, exc.response.text[:200],
+            )
+            return None
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            log.warning(
+                "wa_append_message: fallo de red en intento %d/%d (%s): %s",
+                attempt, _HTTP_RETRIES, role, exc,
+            )
+
+        if attempt < _HTTP_RETRIES:
+            await asyncio.sleep(_HTTP_BACKOFF_BASE_S * (2 ** (attempt - 1)))
+
+    log.error(
+        "wa_append_message: agotados %d intentos para %s phone=%s — mensaje no persistido: %s",
+        _HTTP_RETRIES, role, phone, last_exc,
+    )
+    return None
