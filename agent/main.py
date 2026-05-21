@@ -89,6 +89,76 @@ async def health():
     }
 
 
+@app.post("/outbound/send")
+async def outbound_send(request: Request):
+    """Envía un mensaje OUT-BOUND (del operador hacia el cliente).
+
+    Esta ruta es la que invoca Koala OS desde la pestaña Canales >
+    WhatsApp cuando el operador escribe una respuesta. Va siempre
+    detrás de una Edge Function de Supabase (`wa-send-operator-message`)
+    que autentica al usuario y agrega el header `X-Koala-Secret`.
+
+    Body esperado:
+      {
+        "phone":            "+5491136957601",   # E.164
+        "content":          "Hola, ¿en qué te puedo ayudar?",
+        "contacto_nombre":  "Cliente X",       # opcional
+        "location_id":      "loc-pilar",       # opcional
+        "lead_id":          "uuid"             # opcional
+      }
+    """
+    expected = os.getenv("KOALA_OUTBOUND_SECRET", "").strip()
+    if not expected:
+        # No configurado: por seguridad rechazamos.
+        raise HTTPException(503, "outbound disabled")
+
+    provided = request.headers.get("X-Koala-Secret", "").strip()
+    if provided != expected:
+        raise HTTPException(403, "forbidden")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid json")
+
+    phone = (body.get("phone") or "").strip()
+    content = (body.get("content") or "").strip()
+    if not phone or not content:
+        raise HTTPException(400, "phone y content son requeridos")
+
+    contacto_nombre = body.get("contacto_nombre")
+    location_id = body.get("location_id")
+    lead_id = body.get("lead_id")
+
+    logger.info(f"outbound_send → phone={phone} len={len(content)}")
+
+    # 1) Enviar por el proveedor (Twilio / Meta)
+    try:
+        await proveedor.enviar_mensaje(phone, content)
+    except Exception as exc:
+        logger.error(f"outbound_send: proveedor falló: {exc}")
+        raise HTTPException(502, f"proveedor falló: {exc}")
+
+    # 2) Persistir el mensaje en wa_conversations (best-effort)
+    conv_id: str | None = None
+    if _koala_cfg:
+        try:
+            conv_id = await append_wa_message(
+                cfg=_koala_cfg,
+                phone=phone,
+                role="operator",
+                content=content,
+                proveedor=os.getenv("WHATSAPP_PROVIDER", "twilio").lower() or "twilio",
+                contacto_nombre=contacto_nombre,
+                location_id=location_id,
+                lead_id=lead_id,
+            )
+        except Exception as exc:
+            logger.warning(f"outbound_send: append_wa_message falló: {exc}")
+
+    return {"status": "sent", "conversation_id": conv_id}
+
+
 @app.get("/webhook")
 async def webhook_verificacion(request: Request):
     """Verificación GET del webhook (requerido por Meta Cloud API, no-op para otros)."""
