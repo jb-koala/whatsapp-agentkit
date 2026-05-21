@@ -52,7 +52,10 @@ def detectar_local(texto: str) -> Optional[str]:
 class KoalaSyncConfig:
     supabase_url: str
     service_role_key: str
-    default_location_id: str
+    # None cuando KOALA_LOCATION_ID no está seteado: ese caso significa
+    # "todavía no sabemos a qué local pertenece"; lo dejamos NULL en la
+    # DB y se completa cuando el cliente lo mencione (detectar_local).
+    default_location_id: Optional[str] = None
     default_channel: str = "whatsapp"
     lead_source: str = "Agente IA WhatsApp"
 
@@ -66,7 +69,7 @@ class KoalaSyncConfig:
         return cls(
             supabase_url=url.rstrip("/"),
             service_role_key=key,
-            default_location_id=loc or "a confirmar",
+            default_location_id=loc or None,
             default_channel=os.getenv("KOALA_DEFAULT_CHANNEL", "whatsapp"),
             lead_source=os.getenv("KOALA_LEAD_SOURCE", "Agente IA WhatsApp"),
         )
