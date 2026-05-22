@@ -205,6 +205,8 @@ async def upsert_lead_from_message(
     intent_status: Optional[str] = None,
     intent_changed: bool = False,
     resumen_intent: Optional[str] = None,
+    canal: Optional[str] = None,
+    fuente_detalle: Optional[str] = None,
 ) -> Optional[str]:
     """Crea o actualiza un lead en crm_leads según la intención del contacto.
 
@@ -291,11 +293,11 @@ async def upsert_lead_from_message(
             "location_id": loc,
             "nombre": (name or phone)[:120],
             "contacto": phone,
-            "canal": cfg.default_channel,
+            "canal": canal or cfg.default_channel,
             "estado": "nuevo",
             "ultimo_mensaje": last_message[:500],
             "telefono": phone,
-            "fuente_detalle": cfg.lead_source,
+            "fuente_detalle": fuente_detalle or cfg.lead_source,
             "notas_internas": notes_intent,
             "intent": intent_norm,
         }

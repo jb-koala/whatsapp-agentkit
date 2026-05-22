@@ -10,6 +10,7 @@ Sincroniza cada contacto como lead en Koala OS (Supabase).
 import os
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -179,16 +180,21 @@ async def outbound_send(request: Request):
 # ═════════════════════════════════════════════════════════════════
 # Chat web — mismo bot, distinto canal
 # El widget embebible en una página web golpea acá. Reutiliza
-# brain.py + memory.py. Las sesiones web se guardan en SQLite con
-# el prefijo "web:" para no colisionar con números de WhatsApp.
+# brain.py + memory.py + koala_sync.py. Las sesiones web se guardan
+# en SQLite con el prefijo "web:" para no colisionar con números de
+# WhatsApp, y se sincronizan a Koala OS CRM como leads con canal="web".
 # ═════════════════════════════════════════════════════════════════
 
 WEB_SESSION_PREFIX = "web:"
+WEB_CANAL = "web"
+WEB_FUENTE = "Agente IA Web"
+WEB_PROVEEDOR = "web"
 
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=128)
     message: str = Field(..., min_length=1, max_length=4000)
+    nombre: Optional[str] = Field(default=None, max_length=120)
 
 
 class ChatResponse(BaseModel):
@@ -198,9 +204,48 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_web(req: ChatRequest):
-    """Recibe un mensaje del widget web y devuelve la respuesta del bot."""
-    session_key = f"{WEB_SESSION_PREFIX}{req.session_id}"
+    """Recibe un mensaje del widget web, devuelve la respuesta del bot
+    y sincroniza el lead + mensajes a Koala OS CRM (Supabase).
 
+    Replica las 4 fases del webhook de WhatsApp:
+      1. Persistencia inmediata del lead + user message (nunca perder un mensaje)
+      2. (no aplica multimedia en web)
+      3. Generación de respuesta + persistencia del bot message
+      4. Resumen + clasificación de intent (best-effort)
+    """
+    session_id = req.session_id
+    session_key = f"{WEB_SESSION_PREFIX}{session_id}"
+    nombre = req.nombre
+
+    # ─── FASE 1: persistir lead + user message ───────────────────
+    lead_id: Optional[str] = None
+    if _koala_cfg:
+        try:
+            lead_id = await upsert_lead_from_message(
+                cfg=_koala_cfg,
+                phone=session_key,
+                name=nombre or None,
+                last_message=req.message,
+                canal=WEB_CANAL,
+                fuente_detalle=WEB_FUENTE,
+            )
+        except Exception as exc:
+            logger.warning("upsert_lead (web user) falló: %s", exc)
+
+        try:
+            await append_wa_message(
+                cfg=_koala_cfg,
+                phone=session_key,
+                role="user",
+                content=req.message,
+                proveedor=WEB_PROVEEDOR,
+                contacto_nombre=nombre or None,
+                lead_id=lead_id,
+            )
+        except Exception as exc:
+            logger.warning("append_wa_message (web user) falló: %s", exc)
+
+    # ─── FASE 3: generar respuesta + persistir bot message ───────
     historial = await obtener_historial(session_key)
     respuesta = await generar_respuesta(req.message, historial)
 
@@ -210,8 +255,60 @@ async def chat_web(req: ChatRequest):
     except Exception as exc:
         logger.warning("guardar_mensaje (web) falló: %s", exc)
 
-    logger.info(f"web chat session={req.session_id[:8]}… msg='{req.message[:60]}'")
-    return ChatResponse(response=respuesta, session_id=req.session_id)
+    if _koala_cfg:
+        try:
+            await append_wa_message(
+                cfg=_koala_cfg,
+                phone=session_key,
+                role="bot",
+                content=respuesta,
+                proveedor=WEB_PROVEEDOR,
+                contacto_nombre=nombre or None,
+                lead_id=lead_id,
+            )
+        except Exception as exc:
+            logger.warning("append_wa_message (web bot) falló: %s", exc)
+
+    logger.info(f"web chat session={session_id[:8]}… msg='{req.message[:60]}'")
+
+    # ─── FASE 4: resumen + clasificación de intent (best-effort) ─
+    if _koala_cfg:
+        try:
+            historial_completo = await obtener_historial(session_key)
+            open_lead = await koala_find_open_lead(_koala_cfg, session_key)
+            intent_actual = (open_lead or {}).get("intent") or "indefinido"
+
+            analisis = await resumir_conversacion(
+                historial_completo,
+                req.message,
+                intent_actual=intent_actual,
+            )
+            analisis = analisis if isinstance(analisis, dict) else {}
+            resumen = analisis.get("resumen", "") or ""
+            etiquetas_an = analisis.get("etiquetas", []) or []
+            intent_an = analisis.get("intent", "indefinido")
+            status_an = analisis.get("intent_status", "abierto")
+            changed_an = bool(analisis.get("intent_changed", False))
+            resumen_intent = analisis.get("resumen_intent", resumen) or resumen
+
+            await upsert_lead_from_message(
+                cfg=_koala_cfg,
+                phone=session_key,
+                name=nombre or None,
+                last_message=req.message,
+                notas_internas=resumen,
+                etiquetas=etiquetas_an,
+                intent=intent_an,
+                intent_status=status_an,
+                intent_changed=changed_an,
+                resumen_intent=resumen_intent,
+                canal=WEB_CANAL,
+                fuente_detalle=WEB_FUENTE,
+            )
+        except Exception as exc:
+            logger.warning("resumen / upsert (web post) falló: %s", exc)
+
+    return ChatResponse(response=respuesta, session_id=session_id)
 
 
 @app.get("/webhook")
