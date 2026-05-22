@@ -12,7 +12,9 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from agent.brain import generar_respuesta, resumir_conversacion
@@ -61,16 +63,31 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS para panel Koala OS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# CORS para panel Koala OS + widget web
+# Configurable via CORS_EXTRA_ORIGINS (coma-separado). Usar "*" para permitir cualquier origen
+# (recomendado solo para el widget público, ya que /chat no usa cookies).
+_extra_origins = [o.strip() for o in os.getenv("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()]
+if "*" in _extra_origins:
+    _cors_origins = ["*"]
+else:
+    _cors_origins = [
         "https://koala-os.netlify.app",
         "http://localhost:5173",
-    ],
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ] + _extra_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Servir el widget web embebible y la página demo
+_static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 
 @app.get("/")
@@ -157,6 +174,44 @@ async def outbound_send(request: Request):
             logger.warning(f"outbound_send: append_wa_message falló: {exc}")
 
     return {"status": "sent", "conversation_id": conv_id}
+
+
+# ═════════════════════════════════════════════════════════════════
+# Chat web — mismo bot, distinto canal
+# El widget embebible en una página web golpea acá. Reutiliza
+# brain.py + memory.py. Las sesiones web se guardan en SQLite con
+# el prefijo "web:" para no colisionar con números de WhatsApp.
+# ═════════════════════════════════════════════════════════════════
+
+WEB_SESSION_PREFIX = "web:"
+
+
+class ChatRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=128)
+    message: str = Field(..., min_length=1, max_length=4000)
+
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_web(req: ChatRequest):
+    """Recibe un mensaje del widget web y devuelve la respuesta del bot."""
+    session_key = f"{WEB_SESSION_PREFIX}{req.session_id}"
+
+    historial = await obtener_historial(session_key)
+    respuesta = await generar_respuesta(req.message, historial)
+
+    try:
+        await guardar_mensaje(session_key, "user", req.message)
+        await guardar_mensaje(session_key, "assistant", respuesta)
+    except Exception as exc:
+        logger.warning("guardar_mensaje (web) falló: %s", exc)
+
+    logger.info(f"web chat session={req.session_id[:8]}… msg='{req.message[:60]}'")
+    return ChatResponse(response=respuesta, session_id=req.session_id)
 
 
 @app.get("/webhook")

@@ -92,10 +92,7 @@ async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
 
 async def limpiar_historial(telefono: str):
     """Borra todo el historial de una conversación."""
+    from sqlalchemy import delete
     async with async_session() as session:
-        query = select(Mensaje).where(Mensaje.telefono == telefono)
-        result = await session.execute(query)
-        mensajes = result.scalars().all()
-        for msg in mensajes:
-            session.delete(msg)
+        await session.execute(delete(Mensaje).where(Mensaje.telefono == telefono))
         await session.commit()
