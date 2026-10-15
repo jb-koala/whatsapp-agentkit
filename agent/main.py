@@ -18,6 +18,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+import asyncio
+from datetime import datetime, timedelta, timezone
+
 from agent.brain import generar_respuesta, resumir_conversacion
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
 from agent.providers import obtener_proveedor
@@ -26,6 +29,14 @@ from agent.koala_sync import (
     upsert_lead_from_message,
     append_wa_message,
     find_open_lead as koala_find_open_lead,
+    get_location_ai_settings,
+    resolve_location_from_number,
+    resolve_timeout_seconds,
+    fetch_conversation,
+    enqueue_reply,
+    cancel_pending_replies,
+    claim_due_replies,
+    complete_reply,
 )
 
 load_dotenv()
@@ -38,7 +49,15 @@ logger = logging.getLogger("agentkit")
 
 # Proveedor de WhatsApp (se configura en .env con WHATSAPP_PROVIDER)
 proveedor = obtener_proveedor()
+WHATSAPP_PROVIDER_NAME = (os.getenv("WHATSAPP_PROVIDER", "twilio").lower() or "twilio")
 PORT = int(os.getenv("PORT", 8000))
+
+# Modelo híbrido (Coexistence): cada cuánto el worker busca respuestas de IA
+# vencidas en la cola wa_pending_replies.
+WORKER_POLL_SECONDS = max(5, int(os.getenv("KOALA_WORKER_POLL_SECONDS", "20")))
+# Modo de IA por defecto cuando el local no tiene fila en wa_location_settings.
+# 'always' preserva el comportamiento histórico del bot (responde al instante).
+DEFAULT_AI_MODE = (os.getenv("KOALA_DEFAULT_AI_MODE", "always").lower() or "always")
 
 # Configuración de Koala OS CRM (None si faltan variables)
 _koala_cfg = KoalaSyncConfig.from_env()
@@ -55,7 +74,26 @@ async def lifespan(app: FastAPI):
     logger.info("Base de datos inicializada")
     logger.info(f"Servidor AgentKit corriendo en puerto {PORT}")
     logger.info(f"Proveedor de WhatsApp: {proveedor.__class__.__name__}")
-    yield
+
+    worker_task: Optional["asyncio.Task"] = None
+    if _koala_cfg:
+        worker_task = asyncio.create_task(_timeout_worker())
+        logger.info(
+            "Worker de IA de respaldo iniciado (poll=%ss, default_mode=%s)",
+            WORKER_POLL_SECONDS, DEFAULT_AI_MODE,
+        )
+    else:
+        logger.info("Worker de IA de respaldo NO iniciado (Koala OS no configurado)")
+
+    try:
+        yield
+    finally:
+        if worker_task:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(
@@ -311,6 +349,155 @@ async def chat_web(req: ChatRequest):
     return ChatResponse(response=respuesta, session_id=session_id)
 
 
+# ═════════════════════════════════════════════════════════════════
+# Modelo híbrido (Coexistence) — resolución de modo + worker de IA de
+# respaldo. Ver migración 114_wa_hybrid_ai_fallback.sql en Koala OS.
+# ═════════════════════════════════════════════════════════════════
+
+def _parse_iso(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _send_kwargs(phone_number_id: str) -> dict:
+    """Kwargs de envío para rutear al número correcto (solo Meta)."""
+    if phone_number_id and WHATSAPP_PROVIDER_NAME == "meta":
+        return {"from_phone_number_id": phone_number_id}
+    return {}
+
+
+async def _resolve_ai_mode(conv_mode: Optional[str], location_id: Optional[str]) -> str:
+    """Modo efectivo: override de conversación > config del local > default.
+
+    Valores: 'off' | 'hybrid' | 'always'.
+    """
+    mode = (conv_mode or "inherit").lower()
+    if mode in ("off", "hybrid", "always"):
+        return mode
+    settings = await get_location_ai_settings(_koala_cfg, location_id) if _koala_cfg else None
+    if settings and settings.get("ai_mode") in ("off", "hybrid", "always"):
+        return settings["ai_mode"]
+    return DEFAULT_AI_MODE
+
+
+def _history_and_last_user(mensajes: list) -> tuple[list[dict], str, Optional[datetime]]:
+    """A partir del JSONB `mensajes` arma (historial_para_claude, ultimo_texto_user, ts).
+
+    El historial se devuelve SIN el último mensaje del cliente, porque
+    `generar_respuesta` lo recibe aparte como `mensaje`.
+    """
+    hist: list[dict] = []
+    last_user_text = ""
+    last_user_ts: Optional[datetime] = None
+    for m in mensajes or []:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content or content == "__MULTIMEDIA__":
+            continue
+        if role == "user":
+            hist.append({"role": "user", "content": content})
+            last_user_text = content
+            last_user_ts = _parse_iso(m.get("created_at"))
+        elif role in ("bot", "operator"):
+            hist.append({"role": "assistant", "content": content})
+    if hist and hist[-1]["role"] == "user":
+        hist = hist[:-1]
+    return hist, last_user_text, last_user_ts
+
+
+async def _handle_due_reply(pid: str, item: dict) -> None:
+    """Procesa UNA respuesta vencida de la cola: genera, envía y persiste."""
+    conv_id = item.get("conversation_id")
+    try:
+        conv = await fetch_conversation(_koala_cfg, conv_id)
+        if not conv:
+            await complete_reply(_koala_cfg, pid, "cancelled", "conversación inexistente")
+            return
+
+        mensajes = conv.get("mensajes") or []
+
+        # Guard: ¿ya respondió un humano o el bot después del cliente?
+        if mensajes:
+            last_role = (mensajes[-1].get("role") or "")
+            if last_role in ("operator", "bot", "system"):
+                await complete_reply(_koala_cfg, pid, "cancelled", f"ya respondió {last_role}")
+                return
+
+        # Guard: IA apagada en la conversación.
+        if (conv.get("ai_mode") or "") == "off":
+            await complete_reply(_koala_cfg, pid, "cancelled", "IA off en la conversación")
+            return
+
+        # Guard: handoff vigente (un humano tomó la charla hace poco).
+        paused = _parse_iso(conv.get("ai_paused_until"))
+        if paused and paused > datetime.now(timezone.utc):
+            await complete_reply(_koala_cfg, pid, "cancelled", "IA en pausa (handoff)")
+            return
+
+        hist, last_user_text, last_user_ts = _history_and_last_user(mensajes)
+        if not last_user_text:
+            await complete_reply(_koala_cfg, pid, "cancelled", "sin mensaje de cliente")
+            return
+
+        # Guard: ventana de 24 h de Meta (fuera de ventana requiere plantilla).
+        if last_user_ts and (datetime.now(timezone.utc) - last_user_ts) > timedelta(hours=24):
+            await complete_reply(_koala_cfg, pid, "cancelled", "fuera de ventana 24h")
+            return
+
+        respuesta = await generar_respuesta(last_user_text, hist)
+
+        phone = conv.get("telefono") or item.get("telefono")
+        location_id = conv.get("location_id") or item.get("location_id")
+        metadata = conv.get("metadata") or {}
+        pnid = str(metadata.get("phone_number_id") or "") if isinstance(metadata, dict) else ""
+
+        # Persistir el bot ANTES de enviar (no perder el registro).
+        await append_wa_message(
+            cfg=_koala_cfg, phone=phone, role="bot", content=respuesta,
+            proveedor=WHATSAPP_PROVIDER_NAME, location_id=location_id,
+        )
+        ok = await proveedor.enviar_mensaje(phone, respuesta, **_send_kwargs(pnid))
+        if not ok:
+            await complete_reply(_koala_cfg, pid, "failed", "proveedor no pudo enviar")
+            return
+
+        await complete_reply(_koala_cfg, pid, "done")
+        logger.info("IA de respaldo respondió conv=%s (len=%d)", conv_id, len(respuesta))
+    except Exception as exc:
+        logger.warning("_handle_due_reply conv=%s falló: %s", conv_id, exc)
+        try:
+            await complete_reply(_koala_cfg, pid, "failed", str(exc)[:200])
+        except Exception:
+            pass
+
+
+async def _process_due_replies() -> None:
+    due = await claim_due_replies(_koala_cfg, limit=10)
+    for item in due:
+        pid = item.get("id")
+        if pid and item.get("conversation_id"):
+            await _handle_due_reply(pid, item)
+
+
+async def _timeout_worker() -> None:
+    """Loop en background: cada WORKER_POLL_SECONDS procesa la cola vencida."""
+    while True:
+        try:
+            await _process_due_replies()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("timeout_worker: %s", exc)
+        await asyncio.sleep(WORKER_POLL_SECONDS)
+
+
 @app.get("/webhook")
 async def webhook_verificacion(request: Request):
     """Verificación GET del webhook (requerido por Meta Cloud API, no-op para otros)."""
@@ -332,14 +519,49 @@ async def webhook_handler(request: Request):
         mensajes = await proveedor.parsear_webhook(request)
 
         for msg in mensajes:
-            # Ignorar mensajes propios o vacíos
+            # Ignorar mensajes propios (del bot/API) o vacíos
             if msg.es_propio or not msg.texto:
                 continue
 
-            logger.info(f"Mensaje de {msg.telefono} ({msg.nombre}): {msg.texto}")
-
             # Nombre del proveedor para registrar en wa_conversations
-            proveedor_nombre = os.getenv("WHATSAPP_PROVIDER", "twilio").lower() or "twilio"
+            proveedor_nombre = WHATSAPP_PROVIDER_NAME
+            location_id = (getattr(msg, "location_id", "") or None)
+            phone_number_id = (getattr(msg, "phone_number_id", "") or "")
+
+            # Si el mapa de env (KOALA_NUMBER_MAP) no resolvió el local, lo
+            # buscamos en Koala OS por phone_number_id (líneas dadas de alta
+            # desde Canales → WhatsApp). Así no hace falta tocar env vars.
+            if _koala_cfg and not location_id and phone_number_id:
+                try:
+                    location_id = await resolve_location_from_number(_koala_cfg, phone_number_id)
+                except Exception as exc:
+                    logger.warning("resolve_location_from_number falló: %s", exc)
+
+            # ─────────────────────────────────────────────────────────────
+            # COEXISTENCE: echo de la app = respondió un HUMANO del local.
+            # Se registra como `operator`, lo que dispara el handoff en la
+            # RPC wa_append_message (cancela la cola de IA y pausa la IA).
+            # No generamos respuesta del bot.
+            # ─────────────────────────────────────────────────────────────
+            if getattr(msg, "es_operador", False):
+                if _koala_cfg and msg.texto != "__MULTIMEDIA__":
+                    try:
+                        await append_wa_message(
+                            cfg=_koala_cfg,
+                            phone=msg.telefono,
+                            role="operator",
+                            content=msg.texto,
+                            proveedor=proveedor_nombre,
+                            provider_msg_id=msg.mensaje_id or None,
+                            contacto_nombre=msg.nombre or None,
+                            location_id=location_id,
+                        )
+                        logger.info("Echo de la app (operator) → handoff: %s", msg.telefono)
+                    except Exception as exc:
+                        logger.warning("append_wa_message (operator echo) falló: %s", exc)
+                continue
+
+            logger.info(f"Mensaje de {msg.telefono} ({msg.nombre}): {msg.texto}")
 
             # ─────────────────────────────────────────────────────────────
             # FASE 1: PERSISTENCIA DEL USER MESSAGE
@@ -349,6 +571,7 @@ async def webhook_handler(request: Request):
             # `intent="indefinido"` y se promueve en la fase 4.
             # ─────────────────────────────────────────────────────────────
             lead_id = None
+            conv_id = None
             if _koala_cfg:
                 try:
                     lead_id = await upsert_lead_from_message(
@@ -356,13 +579,14 @@ async def webhook_handler(request: Request):
                         phone=msg.telefono,
                         name=msg.nombre or None,
                         last_message=msg.texto,
+                        location_id=location_id,
                     )
                 except Exception as exc:
                     logger.warning("upsert_lead (user) falló: %s", exc)
 
                 if msg.texto != "__MULTIMEDIA__":
                     try:
-                        await append_wa_message(
+                        conv_id = await append_wa_message(
                             cfg=_koala_cfg,
                             phone=msg.telefono,
                             role="user",
@@ -371,18 +595,72 @@ async def webhook_handler(request: Request):
                             provider_msg_id=msg.mensaje_id or None,
                             contacto_nombre=msg.nombre or None,
                             lead_id=lead_id,
+                            location_id=location_id,
+                            metadata=(
+                                {"phone_number_id": phone_number_id}
+                                if phone_number_id else None
+                            ),
                         )
                     except Exception as exc:
                         logger.warning("append_wa_message (user) falló: %s", exc)
 
             # ─────────────────────────────────────────────────────────────
-            # FASE 2: MULTIMEDIA SHORT-CIRCUIT
+            # RESOLUCIÓN DEL MODO DE IA (off / hybrid / always)
+            #   * off    → solo humanos, no respondemos.
+            #   * hybrid → humano primero; encolamos respuesta diferida.
+            #   * always → comportamiento clásico del bot (responde ya).
+            # ─────────────────────────────────────────────────────────────
+            ai_mode = DEFAULT_AI_MODE
+            if _koala_cfg and conv_id:
+                try:
+                    conv = await fetch_conversation(_koala_cfg, conv_id)
+                    conv_mode = (conv or {}).get("ai_mode")
+                    ai_mode = await _resolve_ai_mode(conv_mode, location_id)
+                except Exception as exc:
+                    logger.warning("resolver ai_mode falló: %s", exc)
+
+            if ai_mode == "off":
+                logger.info("ai_mode=off — no se responde (solo humanos): %s", msg.telefono)
+                continue
+
+            if ai_mode == "hybrid":
+                if _koala_cfg and conv_id and msg.texto != "__MULTIMEDIA__":
+                    try:
+                        settings = await get_location_ai_settings(_koala_cfg, location_id) or {}
+                        open_lead = await koala_find_open_lead(_koala_cfg, msg.telefono)
+                        intent_actual = (open_lead or {}).get("intent") or "indefinido"
+                        timeout_s = resolve_timeout_seconds(settings, intent_actual)
+                        respond_after = (
+                            datetime.now(timezone.utc) + timedelta(seconds=timeout_s)
+                        ).isoformat()
+                        await enqueue_reply(
+                            cfg=_koala_cfg,
+                            conversation_id=conv_id,
+                            respond_after_iso=respond_after,
+                            intent=intent_actual,
+                            trigger_message_id=msg.mensaje_id or None,
+                        )
+                        logger.info(
+                            "ai_mode=hybrid — IA encolada en %ss conv=%s intent=%s",
+                            timeout_s, conv_id, intent_actual,
+                        )
+                    except Exception as exc:
+                        logger.warning("enqueue_reply (hybrid) falló: %s", exc)
+                # En híbrido no respondemos ahora: espera al humano o al timeout.
+                # (La multimedia también espera; el worker avisará solo-texto si
+                #  hiciera falta al generar.)
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # FASE 2: MULTIMEDIA SHORT-CIRCUIT (modo always)
             # ─────────────────────────────────────────────────────────────
             if msg.texto == "__MULTIMEDIA__":
                 from agent.providers.twilio import ProveedorTwilio
                 aviso = ProveedorTwilio.MENSAJE_SOLO_TEXTO
                 try:
-                    await proveedor.enviar_mensaje(msg.telefono, aviso)
+                    await proveedor.enviar_mensaje(
+                        msg.telefono, aviso, **_send_kwargs(phone_number_id)
+                    )
                 except Exception as exc:
                     logger.warning("enviar_mensaje (multimedia) falló: %s", exc)
                 if _koala_cfg:
@@ -395,6 +673,7 @@ async def webhook_handler(request: Request):
                             proveedor=proveedor_nombre,
                             contacto_nombre=msg.nombre or None,
                             lead_id=lead_id,
+                            location_id=location_id,
                         )
                     except Exception as exc:
                         logger.warning("append_wa_message (multimedia bot) falló: %s", exc)
@@ -402,10 +681,10 @@ async def webhook_handler(request: Request):
                 continue
 
             # ─────────────────────────────────────────────────────────────
-            # FASE 3: GENERACIÓN DE RESPUESTA + PERSISTENCIA INMEDIATA
+            # FASE 3: GENERACIÓN DE RESPUESTA + PERSISTENCIA INMEDIATA (always)
             # El append del bot ocurre ANTES de cualquier análisis adicional
             # para garantizar que nunca se pierda la conversación, aunque
-            # falle el resumen o Twilio.
+            # falle el resumen o el envío.
             # ─────────────────────────────────────────────────────────────
             historial = await obtener_historial(msg.telefono)
             respuesta = await generar_respuesta(msg.texto, historial)
@@ -417,8 +696,8 @@ async def webhook_handler(request: Request):
             except Exception as exc:
                 logger.warning("guardar_mensaje (SQLite local) falló: %s", exc)
 
-            # 3a — Registrar la respuesta del bot ANTES de mandarla por Twilio
-            # (si Twilio falla, igual queda registro en Koala OS).
+            # 3a — Registrar la respuesta del bot ANTES de mandarla
+            # (si el envío falla, igual queda registro en Koala OS).
             if _koala_cfg:
                 try:
                     await append_wa_message(
@@ -429,13 +708,16 @@ async def webhook_handler(request: Request):
                         proveedor=proveedor_nombre,
                         contacto_nombre=msg.nombre or None,
                         lead_id=lead_id,
+                        location_id=location_id,
                     )
                 except Exception as exc:
                     logger.warning("append_wa_message (bot) falló: %s", exc)
 
             # 3b — Enviar por WhatsApp
             try:
-                await proveedor.enviar_mensaje(msg.telefono, respuesta)
+                await proveedor.enviar_mensaje(
+                    msg.telefono, respuesta, **_send_kwargs(phone_number_id)
+                )
             except Exception as exc:
                 logger.warning("enviar_mensaje (bot) falló: %s", exc)
 
@@ -494,6 +776,7 @@ async def webhook_handler(request: Request):
                         intent_status=status_an,
                         intent_changed=changed_an,
                         resumen_intent=resumen_intent,
+                        location_id=location_id,
                     )
                 except Exception as exc:
                     logger.warning("resumen / upsert (post) falló: %s", exc)
