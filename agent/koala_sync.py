@@ -370,13 +370,10 @@ async def append_wa_message(
     contacto_nombre: Optional[str] = None,
     lead_id: Optional[str] = None,
     msg_type: str = "text",
-    metadata: Optional[dict] = None,
 ) -> Optional[str]:
     """Registra un mensaje en wa_conversations vía la RPC wa_append_message.
 
     role: 'user' (incoming) | 'bot' | 'operator' | 'system' (outgoing).
-    `metadata` se mergea en wa_conversations.metadata (ej. phone_number_id
-    para rutear el envío al número correcto en Coexistence).
     Retorna el id de la conversación, o None si falló.
     """
     phone = (phone or "").strip()
@@ -409,8 +406,6 @@ async def append_wa_message(
         payload["p_contacto_nombre"] = contacto_nombre
     if lead_id:
         payload["p_lead_id"] = lead_id
-    if metadata:
-        payload["p_metadata"] = metadata
 
     # Retries con backoff exponencial: queremos NUNCA perder un mensaje
     # porque Supabase pestañeó. Solo se reintenta ante errores de red /
@@ -457,196 +452,3 @@ async def append_wa_message(
         _HTTP_RETRIES, role, phone, last_exc,
     )
     return None
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Modelo híbrido (Coexistence): config por local + cola de respuestas
-# diferidas de IA. Ver migración 114_wa_hybrid_ai_fallback.sql.
-# ═══════════════════════════════════════════════════════════════════
-
-
-def _rest_headers(cfg: KoalaSyncConfig) -> dict[str, str]:
-    return {
-        "apikey": cfg.service_role_key,
-        "Authorization": f"Bearer {cfg.service_role_key}",
-        "Content-Type": "application/json",
-    }
-
-
-async def _rpc(cfg: KoalaSyncConfig, name: str, payload: dict) -> Optional[object]:
-    """Invoca una RPC de Postgres vía PostgREST. Devuelve el JSON o None."""
-    endpoint = f"{cfg.supabase_url}/rest/v1/rpc/{name}"
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-            r = await client.post(endpoint, headers=_rest_headers(cfg), json=payload)
-            r.raise_for_status()
-            return r.json() if r.content else None
-    except httpx.HTTPError as exc:
-        log.warning("koala_sync._rpc %s: %s", name, exc)
-        return None
-
-
-async def get_location_ai_settings(
-    cfg: KoalaSyncConfig,
-    location_id: Optional[str],
-) -> Optional[dict]:
-    """Config de IA del local (wa_location_settings) o None si no existe."""
-    if not location_id:
-        return None
-    endpoint = f"{cfg.supabase_url}/rest/v1/wa_location_settings"
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-            r = await client.get(
-                endpoint,
-                headers=_rest_headers(cfg),
-                params={
-                    "select": "location_id,ai_mode,fallback_timeout_seconds,"
-                    "intent_timeouts,handoff_pause_minutes",
-                    "location_id": f"eq.{location_id}",
-                    "limit": 1,
-                },
-            )
-            r.raise_for_status()
-            rows = r.json()
-            return rows[0] if rows else None
-    except httpx.HTTPError as exc:
-        log.warning("koala_sync.get_location_ai_settings: %s", exc)
-        return None
-
-
-async def resolve_location_from_number(
-    cfg: KoalaSyncConfig,
-    phone_number_id: Optional[str],
-) -> Optional[str]:
-    """Resuelve location_id a partir del phone_number_id (wa_location_settings).
-
-    Permite dar de alta las líneas DESDE Koala OS (sin KOALA_NUMBER_MAP).
-    Devuelve None si no hay una línea activa con ese phone_number_id.
-    """
-    if not phone_number_id:
-        return None
-    endpoint = f"{cfg.supabase_url}/rest/v1/wa_location_settings"
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-            r = await client.get(
-                endpoint,
-                headers=_rest_headers(cfg),
-                params={
-                    "select": "location_id,active",
-                    "phone_number_id": f"eq.{phone_number_id}",
-                    "limit": 1,
-                },
-            )
-            r.raise_for_status()
-            rows = r.json()
-            if rows and rows[0].get("active", True):
-                return rows[0].get("location_id")
-            return None
-    except httpx.HTTPError as exc:
-        log.warning("koala_sync.resolve_location_from_number: %s", exc)
-        return None
-
-
-def resolve_timeout_seconds(settings: dict, intent: str) -> int:
-    """Timeout efectivo (seg) según intent, con fallback al del local."""
-    intent_timeouts = settings.get("intent_timeouts") or {}
-    if isinstance(intent_timeouts, dict):
-        raw = intent_timeouts.get((intent or "").lower())
-        if raw is not None:
-            try:
-                return max(15, int(raw))
-            except (TypeError, ValueError):
-                pass
-    try:
-        return max(15, int(settings.get("fallback_timeout_seconds", 300)))
-    except (TypeError, ValueError):
-        return 300
-
-
-async def fetch_conversation(
-    cfg: KoalaSyncConfig,
-    conversation_id: str,
-) -> Optional[dict]:
-    """Lee una conversación de wa_conversations por id (incluye mensajes)."""
-    endpoint = f"{cfg.supabase_url}/rest/v1/wa_conversations"
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-            r = await client.get(
-                endpoint,
-                headers=_rest_headers(cfg),
-                params={
-                    "select": "id,telefono,contacto_nombre,location_id,lead_id,"
-                    "proveedor,ai_mode,ai_paused_until,mensajes,metadata",
-                    "id": f"eq.{conversation_id}",
-                    "limit": 1,
-                },
-            )
-            r.raise_for_status()
-            rows = r.json()
-            return rows[0] if rows else None
-    except httpx.HTTPError as exc:
-        log.warning("koala_sync.fetch_conversation: %s", exc)
-        return None
-
-
-async def enqueue_reply(
-    cfg: KoalaSyncConfig,
-    conversation_id: str,
-    respond_after_iso: str,
-    intent: str = "indefinido",
-    trigger_message_id: Optional[str] = None,
-) -> Optional[str]:
-    """Encola (o reprograma) la respuesta diferida de IA."""
-    res = await _rpc(
-        cfg,
-        "wa_enqueue_reply",
-        {
-            "p_conversation_id": conversation_id,
-            "p_respond_after": respond_after_iso,
-            "p_intent": intent or "indefinido",
-            "p_trigger_message_id": trigger_message_id,
-        },
-    )
-    return res if isinstance(res, str) else None
-
-
-async def cancel_pending_replies(
-    cfg: KoalaSyncConfig,
-    conversation_id: str,
-    reason: Optional[str] = None,
-) -> int:
-    """Cancela la cola de IA de una conversación (handoff / nuevo intent)."""
-    res = await _rpc(
-        cfg,
-        "wa_cancel_pending_replies",
-        {"p_conversation_id": conversation_id, "p_reason": reason},
-    )
-    return int(res) if isinstance(res, int) else 0
-
-
-async def claim_due_replies(
-    cfg: KoalaSyncConfig,
-    limit: int = 20,
-    max_attempts: int = 3,
-) -> list[dict]:
-    """Toma las respuestas vencidas listas para enviar (worker)."""
-    res = await _rpc(
-        cfg,
-        "wa_claim_due_replies",
-        {"p_limit": limit, "p_max_attempts": max_attempts},
-    )
-    return res if isinstance(res, list) else []
-
-
-async def complete_reply(
-    cfg: KoalaSyncConfig,
-    pending_id: str,
-    status: str,
-    error: Optional[str] = None,
-) -> None:
-    """Cierra una respuesta tomada (done / failed / cancelled)."""
-    await _rpc(
-        cfg,
-        "wa_complete_reply",
-        {"p_id": pending_id, "p_status": status, "p_error": error},
-    )
